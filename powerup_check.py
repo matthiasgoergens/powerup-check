@@ -299,11 +299,18 @@ pu_harness.sv
     rc = run(args, f"timeout {args.timeout} sby -f {name}.sby", f"{name}.out")
     out = (args.work / f"{name}.out").read_text()
     if engine.startswith("abc") and "Design contains 'x' or 'z' bits" in out:
-        # the AIGER backend refuses some designs (x in initial values that clk2fflogic adds under
-        # multiclock); the SMT backend takes them
+        # the AIGER backend refuses designs that still have x constants after its own techmap
+        # (YosysHQ/sby#371); the SMT backend takes them
         return sby(args, name, mode, depth, defines, chparam, "smtbmc yices")
     m = re.search(r"DONE \((\w+), rc=", out)
     status = m.group(1) if m else ("TIMEOUT" if "Keyboard interrupt" in out or rc == 124 else "ERROR")
+    if status == "TIMEOUT" and mode == "bmc":
+        # how far it got: abc bmc3 prints a line per frame it has finished, smtbmc the step it
+        # is working on, so both count the steps checked without a failure
+        frames = re.findall(r"engine_\d+: +(\d+) \+ :", out)
+        steps = re.findall(r"Checking assertions in step (\d+)", out)
+        done = int(frames[-1]) + 1 if frames else int(steps[-1]) if steps else 0
+        status = f"TIMEOUT (no failure in steps 0-{done - 1} of {depth})" if done else status
     failed = sorted(set(re.findall(r"Assert failed in pu_harness: \S+ \((\w+)\)", out)) |
                     set(re.findall(r"Assert failed in pu_harness: (\w+)\b", out)))
     trace = next(iter(sorted((args.work / name).glob("engine_0/trace*.vcd"))), None)
@@ -426,6 +433,13 @@ def main():
                    "of reset (pins FAILs; trace in the table).")
     elif status["pins"] != "PASS" or status["noreset"] != "FAIL":
         verdict = "**Inconclusive**: see the checks below."
+        # a pins timeout still says how many clocks after reset were checked (reset takes the
+        # first 2 * reset_clocks steps, and a clock is two steps)
+        m = re.search(r"steps 0-(\d+) ", status["pins"])
+        after = (int(m.group(1)) + 1 - 2 * args.reset_clocks) // 2 if m else 0
+        if after > 0 and status["noreset"] == "FAIL":
+            verdict = (f"**Inconclusive**: pins timed out, with the outputs agreeing for the first "
+                       f"{after} of {args.clocks} clocks after reset.")
     elif status.get("prove") == "PASS" and not held:
         verdict = "**Deterministic**: proved for all time after reset."
     else:

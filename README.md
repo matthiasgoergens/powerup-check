@@ -22,7 +22,7 @@ The report (`report.md` in the work directory) starts with a one-line verdict:
 - **Not deterministic**: uncleared registers (or undriven signals) reach the outputs within the checked clocks.
 - **Deterministic for N clocks**: the bounded check passed. The line goes on to say what happened to the unbounded proof: not run, did not succeed, or proved on the condition that the uncleared registers agree when reset ends.
 - **Deterministic**: no register is left uncleared and the induction proof passed, so it holds for all time after reset.
-- **Inconclusive**: `pins` or `noreset` timed out or failed to run, or `noreset` passed.
+- **Inconclusive**: `pins` or `noreset` timed out or failed to run, or `noreset` passed. When `pins` times out, the verdict says for how many clocks after reset the outputs were checked to agree before it stopped.
 
 It also lists the registers reset does not clear, initial values that were dropped, undriven signals, latches, and black boxes.
 
