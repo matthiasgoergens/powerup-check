@@ -51,7 +51,8 @@ def run(args, cmd, log, timeout=None):
                 f"--cpus={args.cpus}", "--volume", f"{OCS}:/ocs:ro",
                 "--volume", f"{args.work}:/work", "--workdir", "/work",
                 "--env", "PATH=/ocs/bin:/usr/bin:/bin", IMAGE, "sh", "-c", cmd]
-    full = ["nice", "ionice", "--class", "idle"] + full
+    if shutil.which("nice") and shutil.which("ionice"):
+        full = ["nice", "ionice", "--class", "idle"] + full
     with open(args.work / log, "w") as f:
         try:
             r = subprocess.run(full, cwd=args.work, stdout=f, stderr=subprocess.STDOUT,
@@ -360,7 +361,7 @@ def main():
     if d["resolved"]:
         report += ["", "Black boxes read from (unknown modules):"] + [f"- {x}" for x in d["resolved"]]
     if d["latches"]:
-        report += ["", "**Latches** (not modelled faithfully; results are unreliable):"] + \
+        report += ["", "**Latches** (modelled by yosys under multiclock; check these by hand):"] + \
                   [f"- `{x}`" for x in d["latches"]]
     if d["init"]:
         report += ["", "**Initial values** (an ASIC ignores these; they were dropped):"] + \
@@ -415,16 +416,23 @@ def main():
     elif status.get("prove") == "PASS" and not held:
         verdict = "**Deterministic**: proved for all time after reset."
     else:
-        verdict = (f"**Deterministic for {args.clocks} clocks** after reset (bounded); "
-                   + ("proved for all time if the uncleared registers agree at reset."
-                      if status.get("prove") == "PASS" else "no unbounded proof."))
+        if "prove" not in status:
+            unbounded = "the unbounded proof was not run."
+        elif status["prove"] != "PASS":
+            unbounded = f"the unbounded proof did not succeed ({status['prove']})."
+        else:
+            unbounded = (f"proved for all time if the {len(held)} uncleared registers agree when "
+                         "reset ends.")
+        verdict = f"**Deterministic for {args.clocks} clocks** after reset (bounded); {unbounded}"
+        if status["held"] != "PASS" or refine_status != "PASS":
+            verdict += " The held or refine check did not pass; see below."
     report[2:2] = [verdict, ""]
     report += ["", "## Checks", "", "| check | result | expected | failed | trace |", "|---|---|---|---|---|"]
     report += [f"| {n} | {s} | {e} | {f} | {t.relative_to(args.work) if t else ''} |"
                for n, s, e, f, t in rows]
     report += ["", "pins: outputs agree for the checked clocks after reset, uncleared registers free.",
                "held: the same, with the uncleared registers equal when reset ends.",
-               "noreset: no reset; must fail, or the outputs do not depend on the registers at all.",
+               "noreset: reset never forced (free like any input); must fail, or the outputs do not depend on the registers.",
                "prove: k-induction, every register equal as the helper, uncleared ones equal at reset."]
     (args.work / "report.md").write_text("\n".join(report) + "\n")
     print("\n".join(report))
