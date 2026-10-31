@@ -69,7 +69,9 @@ def tt_project(d):
     top = re.search(r"^\s*top_module:\s*\"?(\w+)\"?", text, re.M).group(1)
     block = re.search(r"^\s*source_files:\s*\n((?:\s*(?:#.*)?\n|\s+-\s*.*\n)+)", text, re.M)
     files = [f.strip().strip("\"'") for f in re.findall(r"^\s+-\s*([^#\n]+)", block.group(1), re.M)]
-    return top, [d / "src" / f for f in files]
+    # source_files are relative to src/; a few projects give them from the project root instead
+    return top, [d / "src" / f if (d / "src" / f).exists() or not (d / f).exists() else d / f
+                 for f in files]
 
 
 def ports(js, top):
@@ -109,7 +111,13 @@ def prep(args, top, files, libs):
                     shutil.copyfile(h, inc / h.name)
         for i, f in enumerate(files + libs):
             dst = src / f"{i:02d}_{Path(f).name}"
-            shutil.copyfile(f, dst)
+            if i < len(files):
+                shutil.copyfile(f, dst)
+            else:
+                # a black box needs only its ports; simulation models' timing checks can be more
+                # than yosys parses (e.g. $setuphold with empty arguments)
+                dst.write_bytes(re.sub(rb"\bspecify\b.*?\bendspecify\b", b"",
+                                       Path(f).read_bytes(), flags=re.S))
             defs = "".join(f" -D{d}" for d in args.define) + " -Isrc/inc"
             lib = " -lib" if i >= len(files) else ""
             reads.append(f"read_verilog -sv{lib}{defs} src/{dst.name}")
@@ -353,6 +361,8 @@ def main():
         args.search += [p for p in sorted(ref.glob("*_sram/verilog"))]
     if not top or not files:
         ap.error("give --tt-project, or --top and source files")
+    if missing := [str(f) for f in files + args.lib if not Path(f).is_file()]:
+        sys.exit("source files not found: " + " ".join(missing))
 
     d = prep(args, top, files, args.lib)
     report = [f"# Power-up determinism: {top}", "",
