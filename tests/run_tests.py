@@ -4,7 +4,7 @@
 # ///
 """Run powerup_check.py on every design in tests/ and compare the verdict with the expected one.
 
-    tests/run_tests.py WORKDIR
+    tests/run_tests.py WORKDIR [powerup_check.py options, e.g. --runner podman]
 """
 import subprocess
 import sys
@@ -31,6 +31,7 @@ EXPECT = {
 def one(name, work):
     want, extra = EXPECT[name]
     r = subprocess.run([sys.executable, str(HERE.parent / "powerup_check.py"), str(HERE / f"{name}.v"),
+                        *sys.argv[2:],
                         "--top", name, "--work", str(work / name), "--timeout", "600", *extra],
                        capture_output=True, text=True)
     lines = r.stdout.splitlines()

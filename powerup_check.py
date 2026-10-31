@@ -34,14 +34,16 @@ import subprocess
 import sys
 from pathlib import Path
 
-OCS = os.environ.get("POWERUP_OCS", "/var/tmp/oss-cad-suite-20261014/oss-cad-suite")
+# --runner podman: the OSS CAD Suite directory, mounted read-only in an offline container
+OCS = os.environ.get("POWERUP_OCS")
 IMAGE = os.environ.get("POWERUP_IMAGE", "debian:trixie")
 FF_CELLS = {"$dff", "$dffe", "$adff", "$adffe", "$sdff", "$sdffe", "$sdffce", "$dffsr", "$dffsre",
             "$aldff", "$aldffe", "$dlatch", "$adlatch", "$dlatchsr"}
 
 
 def run(args, cmd, log, timeout=None):
-    """Run a shell command in the work directory, in the offline container unless --runner host."""
+    """Run a shell command in the work directory: directly, or with --runner podman in an offline
+    container with the OSS CAD Suite ($POWERUP_OCS) mounted read-only."""
     if args.runner == "host":
         full = ["sh", "-c", cmd]
     else:
@@ -320,12 +322,15 @@ def main():
     ap.add_argument("--clocks", type=int, default=20, help="clocks checked after reset (20)")
     ap.add_argument("--k", type=int, default=8, help="induction depth in half clocks (8)")
     ap.add_argument("--work", type=Path, required=True, help="work directory (created)")
-    ap.add_argument("--runner", choices=("podman", "host"), default="podman")
+    ap.add_argument("--runner", choices=("host", "podman"), default="host",
+                    help="host: yosys, sby, iverilog from PATH; podman: in a container, see POWERUP_OCS")
     ap.add_argument("--cpus", type=int, default=4)
     ap.add_argument("--timeout", type=int, default=3600, help="seconds per formal run (3600)")
     ap.add_argument("--no-prove", action="store_true", help="skip the k-induction")
     args = ap.parse_args()
     args.work = args.work.resolve()
+    if args.runner == "podman" and not OCS:
+        ap.error("--runner podman needs POWERUP_OCS, the OSS CAD Suite directory")
     args.work.mkdir(parents=True, exist_ok=True)
     if args.tt_project:
         top, files = tt_project(args.tt_project)
