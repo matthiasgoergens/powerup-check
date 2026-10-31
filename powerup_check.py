@@ -97,6 +97,7 @@ def prep(args, top, files, libs):
         "memory_map",
         "opt_clean",
         "setattr -unset init w:*",
+        "tee -q -o check.txt check",
         "tee -q -o latches.txt select -list t:$dlatch t:$adlatch t:$dlatchsr t:$sr t:$_DLATCH*",
         "write_json orig.json",
         "expose -evert c:* t:$* %d",  # black-box instances only, not every wire
@@ -124,9 +125,11 @@ def prep(args, top, files, libs):
             ff_bits += 1
     reg_bits = sum(regs.values())
     init = [l.strip() for l in (args.work / "init.txt").read_text().splitlines() if l.strip()]
+    undriven = sorted(set(re.findall(r"Wire [^.\s]+\.\\?(\S+) is used but has no driver",
+                                     (args.work / "check.txt").read_text())))
     latches = [l.strip() for l in (args.work / "latches.txt").read_text().splitlines() if l.strip()]
     return dict(top=top, orig=po, bb=bb, regs=regs, ff_bits=ff_bits, reg_bits=reg_bits,
-                init=init, latches=latches)
+                init=init, latches=latches, undriven=undriven)
 
 
 def roles(args, d):
@@ -328,10 +331,16 @@ def main():
         named = {**{f"o_{k}": n for k, n in enumerate(outputs)},
                  **{f"bb_{k}": f"black-box input {n}" for k, n in enumerate(bb_out)}}
         rows.append((name, st, expect, ", ".join(named.get(f, f) for f in fl), tr))
+    # undriven bits become free inputs, independent in each copy: on silicon they float
+    undriven = d["undriven"]
+    if undriven:
+        report += ["", f"## Undriven signals ({len(undriven)}; free and independent in each copy)", ""]
+        report += [f"- `{u}`" for u in undriven]
     status = {n: s for n, s, *_ in rows}
     if status["pins"] == "FAIL":
-        verdict = (f"**Not deterministic**: registers that reset does not clear reach the outputs "
-                   f"within {args.clocks} clocks of reset (pins FAILs; trace in the table).")
+        cause = "registers that reset does not clear" + (" or undriven signals" if undriven else "")
+        verdict = (f"**Not deterministic**: {cause} reach the outputs within {args.clocks} clocks "
+                   "of reset (pins FAILs; trace in the table).")
     elif status["pins"] != "PASS" or status["noreset"] != "FAIL":
         verdict = "**Inconclusive**: see the checks below."
     elif status.get("prove") == "PASS" and not held:
