@@ -78,38 +78,72 @@ def vid(name):
     return name if re.fullmatch(r"[A-Za-z_]\w*", name) else f"\\{name} "
 
 
+def find_module(name, dirs):
+    """A Verilog file under dirs that defines module name (to read as a black box)."""
+    pat = re.compile(rb"^\s*module\s+" + re.escape(name.encode()) + rb"\b", re.M)
+    for d in dirs:
+        for f in sorted(Path(d).rglob("*.v")) + sorted(Path(d).rglob("*.sv")):
+            if ".git" not in f.parts and f.is_file() and pat.search(f.read_bytes()):
+                return f
+    return None
+
+
 def prep(args, top, files, libs):
     src = args.work / "src"
     src.mkdir(exist_ok=True)
-    reads = []
-    for i, f in enumerate(files + libs):
-        dst = src / f"{i:02d}_{Path(f).name}"
-        shutil.copyfile(f, dst)
-        defs = "".join(f" -D{d}" for d in args.define)
-        lib = " -lib" if i >= len(files) else ""
-        reads.append(f"read_verilog -sv{lib}{defs} src/{dst.name}")
-    (args.work / "prep.ys").write_text("\n".join(reads + [
-        f"hierarchy -check -top {top}",
-        "proc",
-        "tee -q -o init.txt select -list a:init",
-        "flatten",
-        "memory -nomap",
-        "memory_map",
-        "opt_clean",
-        "setattr -unset init w:*",
-        "tee -q -o check.txt check",
-        "tee -q -o latches.txt select -list t:$dlatch t:$adlatch t:$dlatchsr t:$sr t:$_DLATCH*",
-        "write_json orig.json",
-        "expose -evert c:* t:$* %d",  # black-box instances only, not every wire
-        "write_json evert.json",
-        "expose -dff",
-        "opt_clean",
-        "write_json dut.json",
-        f"rename {top} pu_dut",
-        "write_verilog -noattr pu_dut.v",
-    ]) + "\n")
-    if run(args, "yosys -q -l prep.log prep.ys", "prep.out") != 0:
-        sys.exit(f"yosys failed, see {args.work}/prep.log and prep.out")
+    libs, resolved = list(libs), []
+    for attempt in range(40):
+        reads = [f"read_liberty -ignore_miss_func src/lib{i:02d}_{Path(f).name}"
+                 for i, f in enumerate(args.liberty)]
+        for i, f in enumerate(args.liberty):
+            shutil.copyfile(f, src / f"lib{i:02d}_{Path(f).name}")
+        # `include files: everything next to a source, under its own name
+        inc = src / "inc"
+        inc.mkdir(exist_ok=True)
+        for d in dict.fromkeys(Path(f).parent for f in files):
+            for h in d.iterdir():
+                if h.is_file() and h.suffix in (".vh", ".svh", ".h", ".v", ".sv", ".inc"):
+                    shutil.copyfile(h, inc / h.name)
+        for i, f in enumerate(files + libs):
+            dst = src / f"{i:02d}_{Path(f).name}"
+            shutil.copyfile(f, dst)
+            defs = "".join(f" -D{d}" for d in args.define) + " -Isrc/inc"
+            lib = " -lib" if i >= len(files) else ""
+            reads.append(f"read_verilog -sv{lib}{defs} src/{dst.name}")
+        (args.work / "prep.ys").write_text("\n".join(reads + [
+            f"hierarchy -check -top {top}",
+            "proc",
+            "tee -q -o init.txt select -list a:init",
+            "flatten",
+            "memory -nomap",
+            "memory_map",
+            "opt_clean",
+            "setattr -unset init w:*",
+            "tee -q -o check.txt check",
+            "tee -q -o latches.txt select -list t:$dlatch t:$adlatch t:$dlatchsr t:$sr t:$_DLATCH*",
+            "write_json orig.json",
+            "expose -evert c:* t:$* %d",  # black-box instances only, not every wire
+            "write_json evert.json",
+            "expose -dff",
+            "opt_clean",
+            "write_json dut.json",
+            f"rename {top} pu_dut",
+            "write_verilog -noattr pu_dut.v",
+        ]) + "\n")
+        if run(args, "yosys -q -l prep.log prep.ys", "prep.out") == 0:
+            break
+        # an unknown module: read its definition, from the project or the search path, as a black box
+        m = re.search(r"Module `\\?(\S+?)' referenced in module .* is not part of the design",
+                      (args.work / "prep.out").read_text())
+        # only hard macros and cells: an RTL module read as a black box would hide its registers
+        f = (m and re.fullmatch(args.blackbox_names, m.group(1))
+             and find_module(m.group(1), args.search))
+        if not f:
+            sys.exit(f"yosys failed, see {args.work}/prep.log and prep.out")
+        libs.append(f)
+        resolved.append(f"{m.group(1)}: {f}")
+    else:
+        sys.exit("too many unknown modules")
     load = lambda n: json.loads((args.work / n).read_text())
     orig, evert, dut = load("orig.json"), load("evert.json"), load("dut.json")
     po, pe, pd = ports(orig, top), ports(evert, top), ports(dut, top)
@@ -129,7 +163,7 @@ def prep(args, top, files, libs):
                                      (args.work / "check.txt").read_text())))
     latches = [l.strip() for l in (args.work / "latches.txt").read_text().splitlines() if l.strip()]
     return dict(top=top, orig=po, bb=bb, regs=regs, ff_bits=ff_bits, reg_bits=reg_bits,
-                init=init, latches=latches, undriven=undriven)
+                init=init, latches=latches, undriven=undriven, resolved=resolved)
 
 
 def roles(args, d):
@@ -221,7 +255,8 @@ def harness(args, d, held):
     (args.work / "pu_harness.sv").write_text("\n".join(L) + "\n")
 
 
-def sby(args, name, mode, depth, defines=(), chparam=None, engine="smtbmc yices"):
+def sby(args, name, mode, depth, defines=(), chparam=None, engine=None):
+    engine = engine or ("abc bmc3" if mode == "bmc" else "smtbmc yices")
     defs = "".join(f" -D {x}" for x in defines)
     text = f"""[options]
 mode {mode}
@@ -259,6 +294,14 @@ def main():
     ap.add_argument("--top", help="top module")
     ap.add_argument("--lib", type=Path, action="append", default=[],
                     help="black-box declarations (read with -lib); instances become ports")
+    ap.add_argument("--liberty", type=Path, action="append", default=[],
+                    help="Liberty file whose cells are modelled from their functions (standard cells)")
+    ap.add_argument("--search", type=Path, action="append", default=[],
+                    help="directory searched for unknown modules, read as black boxes")
+    ap.add_argument("--blackbox-names", default=r"RM_IHPSG13_\w+|sg13\w+",
+                    help="regex: unknown modules that may be read as black boxes (hard macros, cells)")
+    ap.add_argument("--ihp", type=Path, help="an IHP PDK root (ihp-sg13cmos5l): standard cells from "
+                    "Liberty, SRAM macros as black boxes")
     ap.add_argument("--define", action="append", default=[], help="Verilog define, NAME or NAME=V")
     ap.add_argument("--clock", default="clk")
     ap.add_argument("--reset", default="rst_n")
@@ -277,9 +320,19 @@ def main():
     args.work.mkdir(parents=True, exist_ok=True)
     if args.tt_project:
         top, files = tt_project(args.tt_project)
+        files += args.files  # extra sources, e.g. the netlist of a hardened macro
         top = args.top or top
     else:
         top, files = args.top, args.files
+    if args.tt_project:
+        root = args.tt_project.resolve()
+        while not (root / ".git").exists() and root.parent != root:
+            root = root.parent
+        args.search.insert(0, root if (root / ".git").exists() else args.tt_project)
+    if args.ihp:
+        ref = args.ihp / "libs.ref"
+        args.liberty += sorted(ref.glob("*_stdcell/lib/*_stdcell_typ_1p20V_25C.lib"))
+        args.search += [p for p in sorted(ref.glob("*_sram/verilog"))]
     if not top or not files:
         ap.error("give --tt-project, or --top and source files")
 
@@ -290,6 +343,8 @@ def main():
     if d["ff_bits"] != d["reg_bits"]:
         report += [f"", f"**WARNING**: {d['ff_bits']} flip-flop bits but {d['reg_bits']} register "
                    "bits exposed; the helper does not cover every flip-flop."]
+    if d["resolved"]:
+        report += ["", "Black boxes read from (unknown modules):"] + [f"- {x}" for x in d["resolved"]]
     if d["latches"]:
         report += ["", "**Latches** (not modelled faithfully; results are unreliable):"] + \
                   [f"- `{x}`" for x in d["latches"]]
