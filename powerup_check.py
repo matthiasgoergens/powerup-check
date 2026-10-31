@@ -37,7 +37,7 @@ from pathlib import Path
 OCS = os.environ.get("POWERUP_OCS", "/var/tmp/oss-cad-suite-20261014/oss-cad-suite")
 IMAGE = os.environ.get("POWERUP_IMAGE", "debian:trixie")
 FF_CELLS = {"$dff", "$dffe", "$adff", "$adffe", "$sdff", "$sdffe", "$sdffce", "$dffsr", "$dffsre",
-            "$aldff", "$aldffe"}
+            "$aldff", "$aldffe", "$dlatch", "$adlatch", "$dlatchsr"}
 
 
 def run(args, cmd, log, timeout=None):
@@ -120,6 +120,9 @@ def prep(args, top, files, libs):
             "opt_clean",
             "setattr -unset init w:*",
             "tee -q -o check.txt check",
+            # an x constant is one fixed value in every chip, so the same in both copies; undriven
+            # wires are not touched and stay free in each copy
+            "setundef -zero",
             "tee -q -o latches.txt select -list t:$dlatch t:$adlatch t:$dlatchsr t:$sr t:$_DLATCH*",
             "write_json orig.json",
             "expose -evert c:* t:$* %d",  # black-box instances only, not every wire
@@ -155,7 +158,8 @@ def prep(args, top, files, libs):
     for c in evert["modules"][top]["cells"].values():
         if c["type"] in FF_CELLS:
             ff_bits += int(c["parameters"]["WIDTH"], 2)
-        elif re.fullmatch(r"\$_(DFF|DFFE|SDFF|SDFFE|SDFFCE|DFFSR|DFFSRE|ALDFF|ALDFFE)_\w+_", c["type"]):
+        elif re.fullmatch(r"\$_(DFF|DFFE|SDFF|SDFFE|SDFFCE|DFFSR|DFFSRE|ALDFF|ALDFFE|DLATCH|DLATCHSR)_\w+_",
+                          c["type"]):
             ff_bits += 1
     reg_bits = sum(regs.values())
     init = [l.strip() for l in (args.work / "init.txt").read_text().splitlines() if l.strip()]
@@ -258,6 +262,7 @@ def harness(args, d, held):
 def sby(args, name, mode, depth, defines=(), chparam=None, engine=None):
     engine = engine or ("abc bmc3" if mode == "bmc" else "smtbmc yices")
     defs = "".join(f" -D {x}" for x in defines)
+    shutil.rmtree(args.work / name, ignore_errors=True)
     text = f"""[options]
 mode {mode}
 depth {depth}
@@ -279,6 +284,10 @@ pu_harness.sv
     (args.work / f"{name}.sby").write_text(text)
     rc = run(args, f"timeout {args.timeout} sby -f {name}.sby", f"{name}.out")
     out = (args.work / f"{name}.out").read_text()
+    if engine.startswith("abc") and "Design contains 'x' or 'z' bits" in out:
+        # the AIGER backend refuses some designs (x in initial values that clk2fflogic adds under
+        # multiclock); the SMT backend takes them
+        return sby(args, name, mode, depth, defines, chparam, "smtbmc yices")
     m = re.search(r"DONE \((\w+), rc=", out)
     status = m.group(1) if m else ("TIMEOUT" if "Keyboard interrupt" in out or rc == 124 else "ERROR")
     failed = sorted(set(re.findall(r"Assert failed in pu_harness: \S+ \((\w+)\)", out)) |
