@@ -25,6 +25,7 @@ EXPECT = {
     "divclk": ("**Not deterministic**", []),
     "inreset": ("**Not deterministic**", []),
     "late": ("**Not deterministic**", []),
+    "shiftx": ("**Deterministic**", []),
 }
 
 

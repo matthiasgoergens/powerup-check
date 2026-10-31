@@ -126,6 +126,9 @@ def prep(args, top, files, libs):
             # an x constant is one fixed value in every chip, so the same in both copies; undriven
             # wires are not touched and stay free in each copy
             "setundef -zero",
+            # the same for out-of-range reads of a variable part-select ($shiftx gives x there);
+            # this also keeps the x out of sby's AIGER flow (YosysHQ/sby#371)
+            "chtype -map $shiftx $shift",
             "tee -q -o latches.txt select -list t:$dlatch t:$adlatch t:$dlatchsr t:$sr t:$_DLATCH*",
             "write_json orig.json",
             "expose -evert c:* t:$* %d",  # black-box instances only, not every wire
