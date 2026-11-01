@@ -317,6 +317,86 @@ pu_harness.sv
     return status, failed, trace
 
 
+def blame(args, trace_dir, max_runs=300):
+    """The power-up state a failing pins trace needs: replay its witness with copy_b starting like
+    copy_a for every register outside a candidate set, and shrink the set while the outputs still
+    differ. Returns (registers, note); registers is None if the replay did not reproduce the failure,
+    and empty if the failure remains with every register starting equal (undriven signals)."""
+    w = json.loads((trace_dir / "trace.yw").read_text())
+    # step 0 sets every signal, start values included; its bit string holds the signals in list
+    # order with the first one in the last character, so reversing it puts signal k's bits at
+    # increasing indices
+    bits = w["steps"][0]["bits"][::-1]
+    pieces = {}  # (copy, register path) -> {offset in the register: slice of bits}
+    at = 0
+    for x in w["signals"]:
+        if x["init_only"]:
+            pieces.setdefault((x["path"][0], tuple(x["path"][1:])), {})[x["offset"]] = \
+                slice(at, at + x["width"])
+        at += x["width"]
+    regs = [r for c, r in pieces if c == "\\copy_b" and ("\\copy_a", r) in pieces]
+
+    def same_start(b, r):
+        return all(b[s] == b[pieces["\\copy_a", r][o]] for o, s in pieces["\\copy_b", r].items())
+
+    differ = [r for r in regs if not same_start(bits, r)]
+    model = trace_dir.parent / "model" / "design_prep.il"
+    out = args.work / "blame"
+    shutil.rmtree(out, ignore_errors=True)
+    out.mkdir()
+    runs = 0
+
+    def fails(free_sets):
+        """For each set: does the trace still fail with only those registers differing at power-up?
+        None if yosys itself failed."""
+        nonlocal runs
+        script = [f"read_rtlil {model.relative_to(args.work)}"]
+        for i, free in enumerate(free_sets):
+            b = list(bits)
+            for r in regs:
+                if r not in free:
+                    for o, s in pieces["\\copy_b", r].items():
+                        b[s] = b[pieces["\\copy_a", r][o]]
+            v = dict(w, steps=[{"bits": "".join(b)[::-1]}] + w["steps"][1:])
+            (out / f"v{runs}_{i}.yw").write_text(json.dumps(v))
+            script.append(f"tee -q -o blame/v{runs}_{i}.txt sim -r blame/v{runs}_{i}.yw -scope pu_harness")
+        (out / f"run{runs}.ys").write_text("\n".join(script) + "\n")
+        rc = run(args, f"yosys -q -s blame/run{runs}.ys", f"blame/run{runs}.log")
+        runs += 1
+        if rc != 0:
+            return None
+        return ["Failed assertion" in (out / f"v{runs - 1}_{i}.txt").read_text()
+                for i in range(len(free_sets))]
+
+    first = fails([set(differ), set()])
+    if first is None:
+        return None, "the replay failed to run; see blame/run0.log"
+    every, none = first
+    if not every:
+        return None, "the replay of the trace did not reproduce the failure"
+    if none:
+        return [], ""
+    # halve while one half is enough on its own
+    need = list(differ)
+    while len(need) > 1 and runs < max_runs:
+        half = len(need) // 2
+        r = fails([set(need[:half]), set(need[half:])])
+        if not r or not any(r):
+            break
+        need = need[:half] if r[0] else need[half:]
+    # the rest needs a combination: drop registers one at a time while the trace still fails, and
+    # repeat until a whole pass drops nothing
+    dropped = True
+    while dropped and len(need) > 1 and runs < max_runs:
+        dropped = False
+        for r in list(need):
+            if len(need) > 1 and runs < max_runs and (fails([set(need) - {r}]) or [False])[0]:
+                need.remove(r)
+                dropped = True
+    note = "" if runs < max_runs else f" (stopped after {max_runs} replays; may not be minimal)"
+    return need, note
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("files", nargs="*", type=Path, help="Verilog sources")
@@ -407,7 +487,7 @@ def main():
     if refine_status != "PASS":
         report += ["", f"Refinement ended {refine_status} after {rounds} rounds (failed: {failed}); see refine.out."]
 
-    rows = []
+    rows, pins_trace = [], None
     depth = 2 * (args.reset_clocks + args.clocks)
     for name, mode, dp, defs, ch, expect in (
             ("pins", "bmc", depth, (), None, "PASS"),
@@ -421,6 +501,8 @@ def main():
         named = {**{f"o_{k}": n for k, n in enumerate(outputs)},
                  **{f"bb_{k}": f"black-box input {n}" for k, n in enumerate(bb_out)}}
         rows.append((name, st, expect, ", ".join(named.get(f, f) for f in fl), tr))
+        if name == "pins":
+            pins_trace = tr
     # undriven bits become free inputs, independent in each copy: on silicon they float
     undriven = d["undriven"]
     if undriven:
@@ -453,6 +535,19 @@ def main():
         verdict = f"**Deterministic for {args.clocks} clocks** after reset (bounded); {unbounded}"
         if status["held"] != "PASS" or refine_status != "PASS":
             verdict += " The held or refine check did not pass; see below."
+    if status["pins"] == "FAIL" and not (pins_trace and (pins_trace.parent / "trace.yw").exists()):
+        verdict += " (No witness file to replay, so the registers involved are not named.)"
+    elif status["pins"] == "FAIL":
+        need, note = blame(args, pins_trace.parent)
+        if need is None:
+            verdict += f" ({note}.)"
+        elif not need:
+            verdict += (" The trace still fails with every register starting the same in both "
+                        "copies, so it comes from undriven signals.")
+        else:
+            names = ", ".join(f"`{'.'.join(part.lstrip(chr(92)) for part in r)}`" for r in need)
+            verdict += (f" Replaying the failing trace, a difference in the power-up value of {names} "
+                        f"alone is enough to make the outputs differ{note}; see blame/ for the replays.")
     report[2:2] = [verdict, ""]
     report += ["", "## Checks", "", "| check | result | expected | failed | trace |", "|---|---|---|---|---|"]
     report += [f"| {n} | {s} | {e} | {f} | {t.relative_to(args.work) if t else ''} |"

@@ -19,7 +19,7 @@ Two copies of the design start from independent, arbitrary register contents and
 
 The report (`report.md` in the work directory) starts with a one-line verdict:
 
-- **Not deterministic**: uncleared registers (or undriven signals) reach the outputs within the checked clocks.
+- **Not deterministic**: uncleared registers (or undriven signals) reach the outputs within the checked clocks. The tool then replays the failing trace in simulation with some registers starting equal in both copies, and names a set of registers whose power-up difference alone is enough to make the outputs differ: usually one register or memory word, which tells you where to look. Other sets may be enough too; this is the first one the search finds.
 - **Deterministic for N clocks**: the bounded check passed. The line goes on to say what happened to the unbounded proof: not run, did not succeed, or proved on the condition that the uncleared registers agree when reset ends.
 - **Deterministic**: no register is left uncleared and the induction proof passed, so it holds for all time after reset.
 - **Inconclusive**: `pins` or `noreset` timed out or failed to run, or `noreset` passed. When `pins` times out, the verdict says for how many clocks after reset the outputs were checked to agree before it stopped.

@@ -12,32 +12,32 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 HERE = Path(__file__).parent
-# design: (expected verdict prefix, extra arguments)
+# design: (expected verdict prefix, extra arguments, text the verdict must contain)
 EXPECT = {
     "good": ("**Deterministic**", []),
     "dead": ("**Deterministic**", []),
     "ram": ("**Deterministic for", []),
     "bbram": ("**Deterministic**", ["--lib", str(HERE / "bb_macro.v")]),
-    "leaky": ("**Not deterministic**", []),
+    "leaky": ("**Not deterministic**", [], "`mode` alone"),
     "initval": ("**Not deterministic**", []),
     "async_leak": ("**Not deterministic**", []),
-    "partial": ("**Not deterministic**", []),
+    "partial": ("**Not deterministic**", [], "`r` alone"),
     "divclk": ("**Not deterministic**", []),
     "inreset": ("**Not deterministic**", []),
-    "late": ("**Not deterministic**", []),
+    "late": ("**Not deterministic**", [], "comes from undriven signals"),
     "shiftx": ("**Deterministic**", []),
 }
 
 
 def one(name, work):
-    want, extra = EXPECT[name]
+    want, extra, *contains = EXPECT[name]
     r = subprocess.run([sys.executable, str(HERE.parent / "powerup_check.py"), str(HERE / f"{name}.v"),
                         *sys.argv[2:],
                         "--top", name, "--work", str(work / name), "--timeout", "600", *extra],
                        capture_output=True, text=True)
     lines = r.stdout.splitlines()
     got = lines[2] if len(lines) > 2 else f"(no report; rc={r.returncode}) {r.stderr[-300:]}"
-    return name, got.startswith(want), want, got
+    return name, got.startswith(want) and all(c in got for c in contains), want, got
 
 
 work = Path(sys.argv[1]).resolve()
